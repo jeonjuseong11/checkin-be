@@ -1,9 +1,12 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, SelectQueryBuilder } from 'typeorm';
+import { Readable } from 'node:stream';
 import { AccessEventEntity } from './entities/access-event.entity';
 import { IngestAccessEventDto } from './dto/ingest-access-event.dto';
+import { AccessEventFilterDto } from './dto/access-event-filter.dto';
 import { QueryAccessEventsDto } from './dto/query-access-events.dto';
+import { ExportAccessEventsDto } from './dto/export-access-events.dto';
 import {
   AccessEventItemDto,
   AccessEventsPageDto,
@@ -54,6 +57,54 @@ function decodeCursor(cursor: string): Cursor {
     throw new BadRequestException('유효하지 않은 cursor입니다.');
   }
   return { occurredAt, id };
+}
+
+// ── CSV 내보내기 유틸 ──────────────────────────────────────────────
+// 엑셀이 UTF-8로 읽도록 BOM을 맨 앞에 붙인다(없으면 한글이 깨짐).
+const CSV_BOM = '﻿';
+// 엑셀 친화적으로 줄바꿈은 CRLF.
+const CSV_EOL = '\r\n';
+// 내보낼 컬럼 헤더(한글). 아래 rawToCsvRow의 값 순서와 1:1로 맞춘다.
+const CSV_HEADER = [
+  '발생시각',
+  '게이트',
+  '대상',
+  '방향',
+  '판정',
+  '이벤트ID',
+  '단말ID',
+  '수신시각',
+  '시퀀스',
+  '지각도착',
+].join(',');
+
+// 한 필드를 CSV 규칙대로 이스케이프: 쉼표/따옴표/줄바꿈이 있으면 큰따옴표로 감싸고 내부 따옴표는 중복.
+function csvEscape(value: unknown): string {
+  const s = value == null ? '' : String(value);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+// timestamptz는 드라이버가 Date로 주므로 ISO로 통일(엑셀에서 정렬·가독성).
+function toIso(value: unknown): string {
+  return value instanceof Date ? value.toISOString() : String(value ?? '');
+}
+
+// 스트림 raw 한 행 → CSV 한 줄. select 별칭(occurredAt 등)을 그대로 읽는다.
+function rawToCsvRow(r: Record<string, unknown>): string {
+  return [
+    toIso(r.occurredAt),
+    r.gateId,
+    r.subjectId,
+    r.direction,
+    r.decision,
+    r.eventId,
+    r.deviceId,
+    toIso(r.receivedAt),
+    r.clientEventSeq,
+    r.lateArrival,
+  ]
+    .map(csvEscape)
+    .join(',');
 }
 
 @Injectable()
@@ -158,26 +209,8 @@ export class AccessEventsService {
     const limit = query.limit ?? DEFAULT_PAGE_LIMIT;
 
     // 별칭 e. createQueryBuilder('e')의 'e.프로퍼티'는 실제 컬럼명으로 매핑된다.
-    const qb = this.accessEventsRepository
-      .createQueryBuilder('e')
-      .where('e.clientId = :clientId', { clientId }); // 테넌트 격리(필수, 인덱스 선두 컬럼)
-
-    // 옵션 필터 — 들어온 것만 andWhere로 누적.
-    if (query.from) {
-      qb.andWhere('e.occurredAt >= :from', { from: new Date(query.from) });
-    }
-    if (query.to) {
-      qb.andWhere('e.occurredAt <= :to', { to: new Date(query.to) });
-    }
-    if (query.gateId) {
-      qb.andWhere('e.gateId = :gateId', { gateId: query.gateId });
-    }
-    if (query.subjectId) {
-      qb.andWhere('e.subjectId = :subjectId', { subjectId: query.subjectId });
-    }
-    if (query.direction) {
-      qb.andWhere('e.direction = :direction', { direction: query.direction });
-    }
+    // 테넌트 격리 + 공통 필터(조회/내보내기 공유)를 헬퍼로 적용.
+    const qb = this.scopedQuery(clientId, query);
 
     // keyset 조건: 커서보다 "과거"부터(정렬이 DESC라 다음 페이지=더 오래된 것).
     // row-value 비교 대신 펼친 형태 — 타입 추론도 안전하고 의도가 명확하다.
@@ -206,5 +239,64 @@ export class AccessEventsService {
       nextCursor: hasMore && last ? encodeCursor(last) : null,
       hasMore,
     };
+  }
+
+  // 테넌트 격리(client_id) + 공통 필터를 적용한 베이스 쿼리. 조회/내보내기가 공유한다.
+  private scopedQuery(
+    clientId: string,
+    filter: AccessEventFilterDto,
+  ): SelectQueryBuilder<AccessEventEntity> {
+    const qb = this.accessEventsRepository
+      .createQueryBuilder('e')
+      .where('e.clientId = :clientId', { clientId }); // 필수: 인덱스 선두 컬럼
+
+    // 들어온 필터만 andWhere로 누적.
+    if (filter.from) {
+      qb.andWhere('e.occurredAt >= :from', { from: new Date(filter.from) });
+    }
+    if (filter.to) {
+      qb.andWhere('e.occurredAt <= :to', { to: new Date(filter.to) });
+    }
+    if (filter.gateId) {
+      qb.andWhere('e.gateId = :gateId', { gateId: filter.gateId });
+    }
+    if (filter.subjectId) {
+      qb.andWhere('e.subjectId = :subjectId', { subjectId: filter.subjectId });
+    }
+    if (filter.direction) {
+      qb.andWhere('e.direction = :direction', { direction: filter.direction });
+    }
+    return qb;
+  }
+
+  // 필터에 맞는 전체 출입 이벤트를 CSV로 스트리밍(페이지네이션 없음).
+  // 전부 메모리에 올리지 않고 DB 커서 스트림 → CSV 줄 변환을 흘려보낸다(대용량 안전).
+  streamExportCsv(clientId: string, filter: ExportAccessEventsDto): Readable {
+    const qb = this.scopedQuery(clientId, filter)
+      // 필요한 컬럼만 별칭으로 선택 → raw 스트림 키가 별칭과 1:1(rawToCsvRow가 그대로 읽음).
+      .select('e.occurredAt', 'occurredAt')
+      .addSelect('e.gateId', 'gateId')
+      .addSelect('e.subjectId', 'subjectId')
+      .addSelect('e.direction', 'direction')
+      .addSelect('e.decision', 'decision')
+      .addSelect('e.eventId', 'eventId')
+      .addSelect('e.deviceId', 'deviceId')
+      .addSelect('e.receivedAt', 'receivedAt')
+      .addSelect('e.clientEventSeq', 'clientEventSeq')
+      .addSelect('e.lateArrival', 'lateArrival')
+      .orderBy('e.occurredAt', 'DESC')
+      .addOrderBy('e.id', 'DESC');
+
+    // async generator: BOM+헤더 → 행들을 순서대로 흘린다. 0건이어도 헤더는 나간다.
+    // Readable.from이 백프레셔를 처리하므로 큰 결과도 메모리 폭발 없이 전송된다.
+    async function* csvRows() {
+      yield CSV_BOM + CSV_HEADER + CSV_EOL;
+      const stream = await qb.stream();
+      for await (const raw of stream as AsyncIterable<Record<string, unknown>>) {
+        yield rawToCsvRow(raw) + CSV_EOL;
+      }
+    }
+
+    return Readable.from(csvRows());
   }
 }

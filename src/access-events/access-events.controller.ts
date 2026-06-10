@@ -8,11 +8,13 @@ import {
   UseInterceptors,
   HttpCode,
   HttpStatus,
+  StreamableFile,
 } from '@nestjs/common';
 import { AccessEventsService } from './access-events.service';
 import { IngestAccessEventDto } from './dto/ingest-access-event.dto';
 import { IngestBatchDto } from './dto/ingest-batch.dto';
 import { QueryAccessEventsDto } from './dto/query-access-events.dto';
+import { ExportAccessEventsDto } from './dto/export-access-events.dto';
 import { ApiKeyGuard } from '../auth/api-key.guard';
 import { CurrentClient } from '../auth/current-client.decorator';
 import { IdempotencyInterceptor } from './idempotency.interceptor';
@@ -30,6 +32,22 @@ export class AccessEventsController {
     @Query() query: QueryAccessEventsDto, // 전역 ValidationPipe가 쿼리 파라미터 검증·변환
   ) {
     return this.accessEventsService.findMany(clientId, query);
+  }
+
+  // GET /access-events/export — 필터(기간/게이트/주체/방향)에 맞는 전체를 CSV로 다운로드.
+  // DB(진실의 원천)에서 그 순간 스냅샷을 뽑으므로 위변조 불가. 엑셀에서 바로 열린다(UTF-8 BOM).
+  @Get('export')
+  export(
+    @CurrentClient('id') clientId: string,
+    @Query() filter: ExportAccessEventsDto,
+  ): StreamableFile {
+    const stream = this.accessEventsService.streamExportCsv(clientId, filter);
+    // 파일명에 요청 시각 스탬프(콜론은 파일명 금지문자라 -로 치환).
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    return new StreamableFile(stream, {
+      type: 'text/csv; charset=utf-8',
+      disposition: `attachment; filename="access-events-${stamp}.csv"`,
+    });
   }
 
   // POST /access-events — 단일 출입 이벤트 수집
