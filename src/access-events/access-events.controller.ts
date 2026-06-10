@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import { AccessEventsService } from './access-events.service';
 import { IngestAccessEventDto } from './dto/ingest-access-event.dto';
+import { IngestBatchDto } from './dto/ingest-batch.dto';
 import { ApiKeyGuard } from '../auth/api-key.guard';
 import { CurrentClient } from '../auth/current-client.decorator';
 import { IdempotencyInterceptor } from './idempotency.interceptor';
@@ -28,5 +29,16 @@ export class AccessEventsController {
     @Body() dto: IngestAccessEventDto, // 전역 ValidationPipe가 이미 검증한 깨끗한 DTO
   ) {
     return this.accessEventsService.ingestOne(clientId, dto);
+  }
+
+  // POST /access-events/batch — 음영 복구 배치 수집(부분 성공)
+  // 멱등 인터셉터를 걸지 않는다: 배치는 "이벤트 단위" 멱등(계층 B=서비스/DB)이 핵심(§4.2).
+  @Post('batch')
+  @HttpCode(HttpStatus.OK) // 건별 결과를 담은 200 — 전체 성공/실패가 아닌 부분 성공 응답
+  async ingestBatch(
+    @CurrentClient('id') clientId: string,
+    @Body() dto: IngestBatchDto,
+  ) {
+    return this.accessEventsService.ingestMany(clientId, dto.events);
   }
 }
