@@ -5,6 +5,7 @@ import { AccessEventsService } from './access-events.service';
 import { AccessEventEntity } from './entities/access-event.entity';
 import { ClientsModule } from '../clients/clients.module';
 import { ApiKeyGuard } from '../auth/api-key.guard';
+import { IdempotencyInterceptor } from './idempotency.interceptor';
 
 @Module({
   imports: [
@@ -12,6 +13,7 @@ import { ApiKeyGuard } from '../auth/api-key.guard';
     ClientsModule, // ApiKeyGuard가 쓰는 ClientsService를 빌려온다(ClientsModule이 exports 중)
   ],
   controllers: [AccessEventsController],
-  providers: [AccessEventsService, ApiKeyGuard], // 가드도 DI 대상이므로 provider로 등록
+  // 가드·인터셉터도 DI 대상이므로 provider로 등록(Redis 클라이언트는 @Global RedisModule이 제공)
+  providers: [AccessEventsService, ApiKeyGuard, IdempotencyInterceptor],
 })
 export class AccessEventsModule {}

@@ -4,6 +4,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ClientsModule } from './clients/clients.module';
 import { AccessEventsModule } from './access-events/access-events.module';
+import { RedisModule } from './redis/redis.module';
 
 @Module({
   imports: [
@@ -27,6 +28,9 @@ import { AccessEventsModule } from './access-events/access-events.module';
         synchronize: config.get<string>('DB_SYNCHRONIZE') === 'true',
       }),
     }),
+
+    // 3) Redis 클라이언트를 전역 등록(@Global). 멱등 인터셉터가 주입받는다.
+    RedisModule,
 
     ClientsModule,
 
