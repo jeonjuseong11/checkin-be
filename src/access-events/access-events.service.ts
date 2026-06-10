@@ -1,8 +1,13 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { AccessEventEntity } from './entities/access-event.entity';
 import { IngestAccessEventDto } from './dto/ingest-access-event.dto';
+import { QueryAccessEventsDto } from './dto/query-access-events.dto';
+import {
+  AccessEventItemDto,
+  AccessEventsPageDto,
+} from './dto/access-events-page.dto';
 
 // 수집 결과: 새로 저장됐는지(accepted) 이미 있던 중복인지(duplicate)
 export interface IngestResult {
@@ -20,6 +25,36 @@ export interface BatchIngestResult {
 
 // occurred_at이 수신 시점보다 이만큼 과거면 "지각 도착"으로 표시(아키텍처 §4.4)
 const LATE_ARRIVAL_MS = 7 * 24 * 60 * 60 * 1000; // 7일
+
+// 조회 기본 페이지 크기(쿼리에 limit 없을 때). 상한 200은 DTO의 @Max가 강제.
+const DEFAULT_PAGE_LIMIT = 50;
+
+// keyset 커서 = (occurredAt, id)를 base64url로 감싼 불투명 문자열.
+// 클라이언트는 내부 구조를 몰라도 되고, 받은 nextCursor를 그대로 되돌려주기만 하면 된다.
+interface Cursor {
+  occurredAt: string; // ISO8601
+  id: string; // 동률(같은 occurredAt) 타이브레이커
+}
+
+function encodeCursor(e: AccessEventEntity): string {
+  const raw = `${e.occurredAt.toISOString()}|${e.id}`;
+  return Buffer.from(raw, 'utf8').toString('base64url');
+}
+
+function decodeCursor(cursor: string): Cursor {
+  // 망가진/위조된 커서는 400으로 거부(서버가 깨지지 않게).
+  const raw = Buffer.from(cursor, 'base64url').toString('utf8');
+  const sep = raw.lastIndexOf('|'); // id(uuid)엔 '|'가 없으므로 마지막 구분자가 경계
+  if (sep === -1) {
+    throw new BadRequestException('유효하지 않은 cursor입니다.');
+  }
+  const occurredAt = raw.slice(0, sep);
+  const id = raw.slice(sep + 1);
+  if (!occurredAt || !id || Number.isNaN(Date.parse(occurredAt))) {
+    throw new BadRequestException('유효하지 않은 cursor입니다.');
+  }
+  return { occurredAt, id };
+}
 
 @Injectable()
 export class AccessEventsService {
@@ -111,6 +146,65 @@ export class AccessEventsService {
       accepted,
       duplicate: results.length - accepted,
       results,
+    };
+  }
+
+  // 출입 이벤트 조회(감사) — keyset 페이지네이션 + 기간/게이트/주체/방향 필터.
+  // 항상 client_id로 먼저 좁혀(테넌트 격리) idx_access_event_occurred를 탄다.
+  async findMany(
+    clientId: string,
+    query: QueryAccessEventsDto,
+  ): Promise<AccessEventsPageDto> {
+    const limit = query.limit ?? DEFAULT_PAGE_LIMIT;
+
+    // 별칭 e. createQueryBuilder('e')의 'e.프로퍼티'는 실제 컬럼명으로 매핑된다.
+    const qb = this.accessEventsRepository
+      .createQueryBuilder('e')
+      .where('e.clientId = :clientId', { clientId }); // 테넌트 격리(필수, 인덱스 선두 컬럼)
+
+    // 옵션 필터 — 들어온 것만 andWhere로 누적.
+    if (query.from) {
+      qb.andWhere('e.occurredAt >= :from', { from: new Date(query.from) });
+    }
+    if (query.to) {
+      qb.andWhere('e.occurredAt <= :to', { to: new Date(query.to) });
+    }
+    if (query.gateId) {
+      qb.andWhere('e.gateId = :gateId', { gateId: query.gateId });
+    }
+    if (query.subjectId) {
+      qb.andWhere('e.subjectId = :subjectId', { subjectId: query.subjectId });
+    }
+    if (query.direction) {
+      qb.andWhere('e.direction = :direction', { direction: query.direction });
+    }
+
+    // keyset 조건: 커서보다 "과거"부터(정렬이 DESC라 다음 페이지=더 오래된 것).
+    // row-value 비교 대신 펼친 형태 — 타입 추론도 안전하고 의도가 명확하다.
+    if (query.cursor) {
+      const c = decodeCursor(query.cursor);
+      qb.andWhere(
+        '(e.occurredAt < :cts OR (e.occurredAt = :cts AND e.id < :cid))',
+        { cts: new Date(c.occurredAt), cid: c.id },
+      );
+    }
+
+    // 최신 우선 정렬 + 동률 타이브레이커. limit+1로 "다음 페이지 존재 여부"를 본다.
+    const rows = await qb
+      .orderBy('e.occurredAt', 'DESC')
+      .addOrderBy('e.id', 'DESC')
+      .limit(limit + 1)
+      .getMany();
+
+    // limit을 초과해 1건 더 왔다면 다음 페이지가 있다는 뜻 → 그 1건은 잘라낸다.
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+
+    const last = pageRows[pageRows.length - 1];
+    return {
+      items: pageRows.map((e) => AccessEventItemDto.fromEntity(e)),
+      nextCursor: hasMore && last ? encodeCursor(last) : null,
+      hasMore,
     };
   }
 }
