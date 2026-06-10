@@ -53,4 +53,18 @@ export class ClientsService {
       plainApiKey,
     };
   }
+
+  // ApiKeyGuard가 호출. 들어온 평문 키를 같은 방식(SHA-256)으로 해시해서
+  // api_key_hash가 일치하고 활성 상태인 고객사를 찾는다. 없으면 null.
+  // (DB엔 평문 키를 저장하지 않으므로, 해시를 만들어 대조하는 방식이 유일한 검증 경로.)
+  async findActiveByApiKey(plainApiKey: string): Promise<ClientEntity | null> {
+    const apiKeyHash = crypto
+      .createHash('sha256')
+      .update(plainApiKey)
+      .digest('hex');
+
+    return this.clientsRepository.findOne({
+      where: { apiKeyHash, isActive: true },
+    });
+  }
 }
