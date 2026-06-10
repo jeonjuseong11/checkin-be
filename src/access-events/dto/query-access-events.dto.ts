@@ -1,45 +1,11 @@
 // src/access-events/dto/query-access-events.dto.ts
 import { Type } from 'class-transformer';
-import {
-  IsOptional,
-  IsString,
-  IsNotEmpty,
-  IsIn,
-  IsISO8601,
-  IsInt,
-  Min,
-  Max,
-} from 'class-validator';
+import { IsOptional, IsString, IsInt, Min, Max } from 'class-validator';
+import { AccessEventFilterDto } from './access-event-filter.dto';
 
 // GET /access-events 의 쿼리 파라미터 계약(감사 조회).
-// 쿼리스트링은 전부 string으로 들어오므로, 숫자(limit)는 @Type(() => Number)로 변환한다.
-// 모든 필드 @IsOptional — 필터 없이 부르면 최신순 전체를 페이지 단위로 훑는다.
-export class QueryAccessEventsDto {
-  // 기간 필터(occurredAt 기준). ISO8601 문자열로 받아 서비스에서 Date로 변환.
-  @IsOptional()
-  @IsISO8601({}, { message: 'from은 ISO8601 형식이어야 합니다.' })
-  from?: string;
-
-  @IsOptional()
-  @IsISO8601({}, { message: 'to는 ISO8601 형식이어야 합니다.' })
-  to?: string;
-
-  // 게이트 필터 — idx_access_event_gate (client_id, gate_id, occurred_at)가 받친다.
-  @IsOptional()
-  @IsString()
-  @IsNotEmpty()
-  gateId?: string;
-
-  // 출입 주체(직원/방문자) 필터.
-  @IsOptional()
-  @IsString()
-  @IsNotEmpty()
-  subjectId?: string;
-
-  @IsOptional()
-  @IsIn(['IN', 'OUT'], { message: 'direction은 IN 또는 OUT만 가능합니다.' })
-  direction?: 'IN' | 'OUT';
-
+// 공통 필터(from/to/gateId/subjectId/direction)는 베이스에서 상속, 여기선 페이지네이션만 추가.
+export class QueryAccessEventsDto extends AccessEventFilterDto {
   // 페이지 크기. 기본 50(서비스에서 적용), 무한정 페이로드 방어로 최대 200 상한.
   @IsOptional()
   @Type(() => Number) // 쿼리스트링 "50" → number 50 변환(@IsInt 통과시키기)
